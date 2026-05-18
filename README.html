@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>pgcache — Linux Page Cache 分析工具</title>
+<style>
+  :root { --bg: #f8f9fa; --card: #fff; --border: #dee2e6; --accent: #0d6efd;
+          --code-bg: #f1f3f5; --pre-bg: #212529; --pre-fg: #e9ecef;
+          --h-color: #1a1a2e; --text: #333; --muted: #6c757d; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", Roboto, "Noto Sans SC", sans-serif;
+         background: var(--bg); color: var(--text); line-height: 1.7; }
+  .container { max-width: 960px; margin: 0 auto; padding: 24px 20px 60px; }
+  h1 { font-size: 2em; color: var(--h-color); border-bottom: 3px solid var(--accent);
+       padding-bottom: 10px; margin: 40px 0 24px; }
+  h2 { font-size: 1.5em; color: var(--h-color); margin: 36px 0 16px;
+       padding-left: 12px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 1.2em; color: #444; margin: 24px 0 12px; }
+  h4 { font-size: 1.05em; color: #555; margin: 18px 0 8px; }
+  p { margin: 8px 0; }
+  ul, ol { margin: 8px 0 8px 24px; }
+  li { margin: 4px 0; }
+  code { background: var(--code-bg); padding: 2px 6px; border-radius: 4px;
+         font-family: "Fira Code", "Cascadia Code", "Source Code Pro", monospace;
+         font-size: 0.9em; color: #c7254e; }
+  pre { background: var(--pre-bg); color: var(--pre-fg); padding: 16px 20px;
+        border-radius: 8px; overflow-x: auto; margin: 12px 0;
+        font-size: 0.88em; line-height: 1.6; }
+  pre code { background: none; color: inherit; padding: 0; font-size: inherit; }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0; }
+  th, td { border: 1px solid var(--border); padding: 10px 14px; text-align: left; }
+  th { background: var(--accent); color: #fff; font-weight: 600; }
+  tr:nth-child(even) { background: #f8f9fa; }
+  .card { background: var(--card); border: 1px solid var(--border);
+          border-radius: 8px; padding: 20px; margin: 16px 0; }
+  .flow-box { display: flex; align-items: center; flex-wrap: wrap;
+              justify-content: center; gap: 0; margin: 16px 0; }
+  .flow-step { background: var(--accent); color: #fff; padding: 10px 18px;
+               border-radius: 6px; font-weight: 500; font-size: 0.92em;
+               text-align: center; min-width: 120px; }
+  .flow-arrow { font-size: 1.4em; color: var(--accent); margin: 0 6px;
+                font-weight: bold; }
+  .flow-desc { font-size: 0.82em; color: var(--muted); margin-top: 4px; }
+  .note { background: #fff3cd; border-left: 4px solid #ffc107; padding: 12px 16px;
+          border-radius: 0 6px 6px 0; margin: 16px 0; }
+  .tip { background: #d1e7dd; border-left: 4px solid #198754; padding: 12px 16px;
+         border-radius: 0 6px 6px 0; margin: 16px 0; }
+  .file-tree { background: var(--code-bg); padding: 16px 20px; border-radius: 6px;
+               font-family: monospace; line-height: 1.8; margin: 12px 0; }
+  .tag { display: inline-block; background: var(--accent); color: #fff;
+         padding: 2px 10px; border-radius: 12px; font-size: 0.8em;
+         font-weight: 500; margin: 2px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .toc { background: var(--card); border: 1px solid var(--border);
+         border-radius: 8px; padding: 20px 28px; margin: 20px 0; }
+  .toc ol { margin-left: 20px; }
+  .toc li { margin: 6px 0; }
+  @media (max-width: 600px) {
+    .container { padding: 12px; }
+    h1 { font-size: 1.5em; }
+    pre { padding: 10px; font-size: 0.82em; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+<!-- ============================================================ -->
+<h1>pgcache — Linux Page Cache 分析工具</h1>
+<p style="color:var(--muted);font-size:0.95em;">基于 mincore(2) 系统调用的纯 C 实现，零外部依赖</p>
+
+<div class="toc">
+  <h3>目录</h3>
+  <ol>
+    <li><a href="#principle">实现原理</a>
+      <ol>
+        <li><a href="#pagecache">什么是 Page Cache</a></li>
+        <li><a href="#mincore">mincore 系统调用</a></li>
+        <li><a href="#collect">多进程文件收集</a></li>
+        <li><a href="#mntns">Mount Namespace 切换</a></li>
+        <li><a href="#dataflow">整体数据流</a></li>
+        <li><a href="#struct">关键数据结构</a></li>
+      </ol>
+    </li>
+    <li><a href="#manual">使用手册</a>
+      <ol>
+        <li><a href="#build">编译安装</a></li>
+        <li><a href="#syntax">命令行语法</a></li>
+        <li><a href="#options">选项一览</a></li>
+        <li><a href="#examples">使用示例</a></li>
+        <li><a href="#compare">与其他工具对比</a></li>
+        <li><a href="#notes">注意事项</a></li>
+      </ol>
+    </li>
+  </ol>
+</div>
+
+<!-- ============================================================ -->
+<h1 id="principle">一、实现原理</h1>
+
+<h2 id="pagecache">1.1 什么是 Page Cache</h2>
+
+<p>Linux 内核在读写磁盘文件时，会将文件数据缓存在内存中，这部分内存称为 <strong>Page Cache</strong>（页缓存）。当进程再次访问同一文件时，内核直接从内存返回数据，避免磁盘 I/O，大幅提升性能。</p>
+
+<p>Page Cache 是透明的——用户态程序无法直接操作它，但可以通过 <code>mincore(2)</code> 系统调用<strong>查询</strong>哪些页在缓存中。pgcache 的核心就是利用这一机制。</p>
+
+<div class="card">
+  <h4>Page Cache 的生命周期</h4>
+  <ul>
+    <li><strong>读文件时</strong>：内核将磁盘数据拷贝到 page cache，然后返回给用户态</li>
+    <li><strong>再次读同一文件</strong>：直接从 page cache 返回，不触发磁盘 I/O</li>
+    <li><strong>内存不足时</strong>：内核回收最久未使用的缓存页（类似 LRU）</li>
+    <li><strong>文件被修改</strong>：脏页（dirty page）会定期刷回磁盘</li>
+  </ul>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="mincore">1.2 mincore 系统调用</h2>
+
+<pre><code>int mincore(void *addr, size_t length, unsigned char *vec);</code></pre>
+
+<p><code>mincore</code> 是整个工具的核心。它查询一段虚拟地址区间内哪些页驻留在物理内存（page cache）中。工作流程如下：</p>
+
+<div class="flow-box">
+  <div>
+    <div class="flow-step">open(file)</div>
+    <div class="flow-desc">打开目标文件</div>
+  </div>
+  <span class="flow-arrow">→</span>
+  <div>
+    <div class="flow-step">fstat(fd)</div>
+    <div class="flow-desc">获取文件大小</div>
+  </div>
+  <span class="flow-arrow">→</span>
+  <div>
+    <div class="flow-step">mmap()</div>
+    <div class="flow-desc">映射到虚拟地址空间</div>
+  </div>
+  <span class="flow-arrow">→</span>
+  <div>
+    <div class="flow-step">mincore()</div>
+    <div class="flow-desc">查询每页缓存状态</div>
+  </div>
+  <span class="flow-arrow">→</span>
+  <div>
+    <div class="flow-step">统计 + 输出</div>
+    <div class="flow-desc">计算缓存百分比</div>
+  </div>
+</div>
+
+<h4>详细步骤</h4>
+
+<table>
+  <tr><th>步骤</th><th>系统调用</th><th>说明</th></tr>
+  <tr>
+    <td>1. 打开文件</td>
+    <td><code>open(path, O_RDONLY)</code></td>
+    <td>以只读方式打开目标文件，获得文件描述符 fd</td>
+  </tr>
+  <tr>
+    <td>2. 获取大小</td>
+    <td><code>fstat(fd, &amp;st)</code></td>
+    <td>通过 st_size 获取文件字节数，跳过目录和零大小文件</td>
+  </tr>
+  <tr>
+    <td>3. 内存映射</td>
+    <td><code>mmap(NULL, size, PROT_NONE, MAP_SHARED, fd, 0)</code></td>
+    <td>
+      将文件映射到虚拟地址空间<br>
+      <code>PROT_NONE</code>：不设置读写权限，仅用于查询<br>
+      <code>MAP_SHARED</code>：与 page cache 共享同一份物理页
+    </td>
+  </tr>
+  <tr>
+    <td>4. 查询缓存</td>
+    <td><code>mincore(addr, size, vec)</code></td>
+    <td>
+      内核为每一页（通常 4KB）写入一个字节到 vec<br>
+      <strong>LSB = 1</strong> 表示该页在 page cache 中<br>
+      <strong>LSB = 0</strong> 表示该页不在
+    </td>
+  </tr>
+  <tr>
+    <td>5. 统计</td>
+    <td>遍历 <code>vec[i] &amp; 1</code></td>
+    <td>统计在缓存中的页数，计算 percent = cached/pages × 100</td>
+  </tr>
+  <tr>
+    <td>6. 清理</td>
+    <td><code>munmap()</code> + <code>close()</code></td>
+    <td>解除映射，关闭文件描述符</td>
+  </tr>
+</table>
+
+<h4>mincore 向量示意</h4>
+
+<pre><code>文件大小 = 16KB，页大小 = 4KB → 4 页
+
+vec[0] = 0x01  →  第 1 页在缓存中 ✓
+vec[1] = 0x00  →  第 2 页不在缓存 ✗
+vec[2] = 0x01  →  第 3 页在缓存中 ✓
+vec[3] = 0x01  →  第 4 页在缓存中 ✓
+
+cached = 3,  pages = 4,  percent = 75.0%</code></pre>
+
+<div class="tip">
+  <strong>为什么用 mmap + MAP_SHARED？</strong><br>
+  <code>MAP_SHARED</code> 使得虚拟地址空间中的映射与内核的 page cache 共享同一份物理内存页。
+  因此 <code>mincore</code> 查询的就是 page cache 的真实状态，而不是一份独立的副本。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="collect">1.3 多进程文件收集（--top 模式）</h2>
+
+<p><code>--top N</code> 需要回答一个问题：<strong>系统上所有被映射的文件有哪些？</strong></p>
+<p>答案来自每个进程的 <code>/proc/[pid]/maps</code> 文件。</p>
+
+<h4>/proc/[pid]/maps 文件格式</h4>
+
+<pre><code>地址范围                  权限  偏移      设备    inode  路径名
+00400000-00452000        r--p 00000000  08:01   12345  /usr/bin/vim
+7f1234567000-7f12345a8000 r--p 00000000  08:01   67890  /usr/lib/libc.so.6</code></pre>
+
+<p>第 6 列（以 <code>/</code> 开头）就是被映射的文件路径。pgcache 的收集流程：</p>
+
+<div class="flow-box">
+  <div>
+    <div class="flow-step">枚举所有 PID</div>
+    <div class="flow-desc">读 /proc/ 数字目录</div>
+  </div>
+  <span class="flow-arrow">→</span>
+  <div>
+    <div class="flow-step">过滤 RSS=0</div>
+    <div class="flow-desc">跳过内核线程</div>
+  </div>
+  <span class="flow-arrow">→</span>
+  <div>
+    <div class="flow-step">读 maps</div>
+    <div class="flow-desc">提取文件路径</div>
+  </div>
+  <span class="flow-arrow">→</span>
+  <div>
+    <div class="flow-step">去重</div>
+    <div class="flow-desc">qsort + 相邻去重</div>
+  </div>
+  <span class="flow-arrow">→</span>
+  <div>
+    <div class="flow-step">mincore</div>
+    <div class="flow-desc">检测每个文件</div>
+  </div>
+  <span class="flow-arrow">→</span>
+  <div>
+    <div class="flow-step">排序 + Top N</div>
+    <div class="flow-desc">按缓存降序</div>
+  </div>
+</div>
+
+<h4>为什么要做去重？</h4>
+
+<p>同一个共享库（如 <code>libc.so.6</code>）会被几十个进程同时映射。如果不对路径去重，<code>mincore</code> 会重复检测同一个文件，浪费时间和 CPU。</p>
+
+<p>去重策略：<strong>排序 + 相邻去重</strong>。先用 <code>qsort</code> 对所有路径按字典序排序，再线性扫描去掉相邻重复项。时间复杂度 O(n log n)，无需哈希表。</p>
+
+<!-- ============================================================ -->
+<h2 id="mntns">1.4 Mount Namespace 切换</h2>
+
+<p>在容器（Docker/LXC）环境中，进程看到的文件路径是相对于其 mount namespace 的。例如容器内的 <code>/app/data.db</code> 在宿主机上可能是 <code>/var/lib/docker/overlay2/.../diff/app/data.db</code>。</p>
+
+<p>如果不切换 namespace 直接读 <code>/proc/[pid]/maps</code>，看到的路径在宿主机上可能不存在。pgcache 通过 <code>setns()</code> 解决这个问题：</p>
+
+<pre><code>int fd = open("/proc/[pid]/ns/mnt", O_RDONLY);
+setns(fd, 0);   // 切换到目标进程的 mount namespace
+close(fd);</code></pre>
+
+<div class="note">
+  <strong>注意：</strong><code>setns()</code> 需要 <code>CAP_SYS_ADMIN</code> 权限。普通用户执行时该操作会失败，但 pgcache 采用 best-effort 策略——失败时静默跳过，继续处理下一个进程。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="dataflow">1.5 整体数据流</h2>
+
+<div class="card" style="text-align:center;padding:24px;">
+<pre style="text-align:left;display:inline-block;background:#f1f3f5;color:#333;padding:20px;border-radius:8px;">
+┌──────────────────────────────────────────────────────────────────────┐
+│                           main()                                     │
+│                                                                      │
+│  ┌─ --top N 模式 ──────────────────────────────────────────────────┐ │
+│  │  1. discover_pids()      打开 /proc, 枚举所有数字目录           │ │
+│  │  2. get_pid_rss(pid)     解析 /proc/pid/stat, 过滤 RSS=0       │ │
+│  │  3. switch_mount_ns()    setns() 进入 mount namespace           │ │
+│  │  4. get_pid_maps(pid)    读 /proc/pid/maps, 提取文件路径        │ │
+│  │  5. qsort + dedup        跨所有进程去重                          │ │
+│  │  6. get_file_cache_status()  mmap + mincore 检测缓存             │ │
+│  │  7. sort_by_cached()     按缓存页数降序排序                      │ │
+│  │  8. 截断到 N             取前 N 个                               │ │
+│  │  9. format_stats()       格式化输出                              │ │
+│  └──────────────────────────────────────────────────────────────────┘ │
+│                                                                      │
+│  ┌─ --pid / 文件名模式 ────────────────────────────────────────────┐ │
+│  │  1. switch_mount_ns(pid)                                         │ │
+│  │  2. get_pid_maps(pid)  或使用命令行指定的文件                    │ │
+│  │  3. get_file_cache_status()  对每个文件调用 mincore              │ │
+│  │  4. sort_by_cached()                                              │ │
+│  │  5. format_stats()                                                │ │
+│  └──────────────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────────────┘
+</pre>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="struct">1.6 关键数据结构</h2>
+
+<h4>cache_entry_t — 文件缓存状态</h4>
+
+<pre><code>typedef struct {
+    char    *name;       // 文件路径 (strdup 分配, 调用者负责 free)
+    int64_t  size;       // 文件字节数
+    time_t   timestamp;  // mincore 检测时间 (Unix 时间戳)
+    time_t   mtime;      // 文件最后修改时间
+    int      pages;      // 总页数 = ceil(size / pagesize)
+    int      cached;     // 在 page cache 中的页数
+    int      uncached;   // 不在缓存中的页数
+    double   percent;    // cached / pages × 100.0
+    char    *ppstat;     // 逐页状态: 每个字节 0/1 (仅 --histo/--pps 时分配)
+} cache_entry_t;</code></pre>
+
+<h4>entry_list_t — 动态数组（倍增扩容）</h4>
+
+<pre><code>typedef struct {
+    cache_entry_t *entries;
+    int            count;      // 当前元素数
+    int            capacity;   // 已分配容量
+} entry_list_t;
+
+// 扩容逻辑: capacity = 0 → 64, 否则 capacity *= 2
+void list_push(entry_list_t *list, const cache_entry_t *entry) {
+    if (list->count == list->capacity) {
+        int new_cap = list->capacity == 0 ? 64 : list->capacity * 2;
+        list->entries = realloc(list->entries, new_cap * sizeof(cache_entry_t));
+        list->capacity = new_cap;
+    }
+    list->entries[list->count++] = *entry;
+}</code></pre>
+
+<h4>opts_t — 命令行选项</h4>
+
+<pre><code>typedef struct {
+    int pid;              // --pid PID (0 = 未设置)
+    int top;              // --top N   (0 = 未设置)
+    int nohdr;            // --nohdr   隐藏表头
+    int bname;            // --bname   只显示 basename
+    int terse;            // --terse   CSV 格式
+    int json;             // --json    JSON 格式
+    int histo;            // --histo   直方图
+    int unicode;          // --unicode Unicode 边框表格
+    int pps;              // --pps     JSON 含逐页状态
+    int plain;            // --plain   纯文本无边框
+} opts_t;</code></pre>
+
+<h4>文件结构</h4>
+
+<div class="file-tree">
+c_project/<br>
+├── <strong>pgcache.h</strong> &nbsp; <span style="color:#6c757d;">// 共享数据结构、函数声明、extern opts</span><br>
+├── <strong>mincore.c</strong> &nbsp; <span style="color:#6c757d;">// get_file_cache_status() — 核心 mincore 逻辑</span><br>
+├── <strong>process.c</strong> &nbsp; <span style="color:#6c757d;">// discover_pids(), get_pid_maps(), switch_mount_ns()</span><br>
+├── <strong>format.c</strong> &nbsp; <span style="color:#6c757d;">// 6 种格式化输出 + sort_by_cached()</span><br>
+├── <strong>pgcache.c</strong> &nbsp; <span style="color:#6c757d;">// main(), top(), 参数解析, 动态数组操作</span><br>
+├── <strong>Makefile</strong> &nbsp; <span style="color:#6c757d;">// 构建系统</span><br>
+└── <strong>README.html</strong> &nbsp; <span style="color:#6c757d;">// 本文档</span>
+</div>
+
+<!-- ============================================================ -->
+<h1 id="manual">二、使用手册</h1>
+
+<h2 id="build">2.1 编译安装</h2>
+
+<pre><code># 编译
+cd c_project
+make
+
+# 清理编译产物
+make clean
+
+# 安装到 /usr/local/bin (需要 root)
+sudo make install</code></pre>
+
+<p>编译依赖：<strong>gcc</strong>、<strong>glibc</strong>（提供 mincore/setns/getopt_long）。无需其他第三方库。</p>
+
+<!-- ============================================================ -->
+<h2 id="syntax">2.2 命令行语法</h2>
+
+<pre><code>pgcache [选项] [文件...]</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="options">2.3 选项一览</h2>
+
+<table>
+  <tr><th>选项</th><th>参数</th><th>说明</th></tr>
+  <tr><td><code>--top</code></td><td>N</td><td>显示系统级缓存最大的 N 个文件</td></tr>
+  <tr><td><code>--pid</code></td><td>PID</td><td>显示指定进程映射的所有文件的缓存状态</td></tr>
+  <tr><td><code>--terse</code></td><td>—</td><td>CSV 格式输出</td></tr>
+  <tr><td><code>--json</code></td><td>—</td><td>JSON 格式输出</td></tr>
+  <tr><td><code>--pps</code></td><td>—</td><td>JSON 输出中包含逐页缓存状态数组</td></tr>
+  <tr><td><code>--histo</code></td><td>—</td><td>直方图可视化输出</td></tr>
+  <tr><td><code>--unicode</code></td><td>—</td><td>使用 Unicode 边框字符 (┌┬┐├┼┤└┴┘) 的表格</td></tr>
+  <tr><td><code>--plain</code></td><td>—</td><td>纯文本无边框输出</td></tr>
+  <tr><td><code>--nohdr</code></td><td>—</td><td>隐藏表头（节省垂直空间）</td></tr>
+  <tr><td><code>--bname</code></td><td>—</td><td>只显示文件的 basename（不含路径）</td></tr>
+  <tr><td><code>--help</code></td><td>—</td><td>显示帮助信息</td></tr>
+  <tr><td><code>--version</code></td><td>—</td><td>显示版本号</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="examples">2.4 使用示例</h2>
+
+<h3>查看系统缓存最大的 10 个文件</h3>
+
+<pre><code>$ pgcache --top 10
++------------------------------------------------------+----------------+-------------+----------------+-------------+---------+
+| Name                                                 | Size           | Pages       | Cached Size    | Cached Pages| Percent |
+|------------------------------------------------------+----------------+-------------+----------------+-------------+---------+
+| /opt/google/chrome/chrome                            | 256.019M       | 65541       | 256.019M       | 65541       | 100.000 |
+| /opt/wechat/RadiumWMPF/runtime/WeChatAppEx           | 201.518M       | 51589       | 201.518M       | 51589       | 100.000 |
+| /snap/typora/112/typora/Typora                       | 186.597M       | 47769       | 186.597M       | 47769       | 100.000 |
+| /snap/code/238/usr/share/code/code                   | 183.979M       | 47099       | 183.979M       | 47099       | 100.000 |
+| /snap/thunderbird/1104/usr/lib/thunderbird/libxul.so | 174.981M       | 44796       | 174.981M       | 44796       | 100.000 |
+|------------------------------------------------------+----------------+-------------+----------------+-------------+---------|
+| Sum                                                  | 1003.095M      | 256794      | 1003.095M      | 256794      | 100.000 |
++------------------------------------------------------+----------------+-------------+----------------+-------------+---------+</code></pre>
+
+<div class="card">
+  <h4>表格列说明</h4>
+  <table>
+    <tr><th>列名</th><th>说明</th></tr>
+    <tr><td>Name</td><td>文件完整路径（或 basename，如果使用了 <code>--bname</code>）</td></tr>
+    <tr><td>Size</td><td>文件总大小，自动选择 B/K/M/G/T/P 单位</td></tr>
+    <tr><td>Pages</td><td>文件总页数（1 页 = 4096 字节）</td></tr>
+    <tr><td>Cached Size</td><td>缓存中的大小，估算值 = Size × Percent / 100</td></tr>
+    <tr><td>Cached Pages</td><td>在 page cache 中的页数（由 mincore 精确获得）</td></tr>
+    <tr><td>Percent</td><td>缓存百分比 = Cached Pages / Pages × 100</td></tr>
+    <tr><td>Sum (最后一行)</td><td>所有文件的汇总统计</td></tr>
+  </table>
+</div>
+
+<h3>查看指定文件的缓存状态</h3>
+
+<pre><code>$ pgcache /usr/bin/ls /usr/bin/bash /usr/bin/vim
++---------------+----------------+-------------+----------------+-------------+---------+
+| Name          | Size           | Pages       | Cached Size    | Cached Pages| Percent |
+|---------------+----------------+-------------+----------------+-------------+---------|
+| /usr/bin/vim  | 3.935M         | 1008        | 3.935M         | 1008        | 100.000 |
+| /usr/bin/bash | 1.379M         | 354         | 1.379M         | 354         | 100.000 |
+| /usr/bin/ls   | 138.977K       | 35          | 138.977K       | 35          | 100.000 |
+|---------------+----------------+-------------+----------------+-------------+---------|
+| Sum           | 5.450M         | 1397        | 5.450M         | 1397        | 100.000 |
++---------------+----------------+-------------+----------------+-------------+---------+</code></pre>
+
+<h3>查看某进程映射的所有文件</h3>
+
+<pre><code>$ pgcache --pid 1234</code></pre>
+
+<p>显示 PID 为 1234 的进程所有内存映射文件的缓存状态。自动切换到该进程的 mount namespace。</p>
+
+<h3>只显示 basename</h3>
+
+<pre><code>$ pgcache --bname --top 5
++---------+----------------+-------------+----------------+-------------+---------+
+| Name    | Size           | Pages       | Cached Size    | Cached Pages| Percent |
+|---------+----------------+-------------+----------------+-------------+---------+
+| chrome  | 256.019M       | 65541       | 256.019M       | 65541       | 100.000 |
+| WeChat..| 201.518M       | 51589       | 201.518M       | 51589       | 100.000 |
+| Typora  | 186.597M       | 47769       | 186.597M       | 47769       | 100.000 |
+| code    | 183.979M       | 47099       | 183.979M       | 47099       | 100.000 |
+| libxul..| 174.981M       | 44796       | 174.981M       | 44796       | 100.000 |
+|---------+----------------+-------------+----------------+-------------+---------|
+| Sum     | 1003.095M      | 256794      | 1003.095M      | 256794      | 100.000 |
++---------+----------------+-------------+----------------+-------------+---------+</code></pre>
+
+<h3>Unicode 边框表格</h3>
+
+<pre><code>$ pgcache --unicode --top 3
+┌────────────────────────────────────────────┬────────────────┬─────────────┬────────────────┬─────────────┬─────────┐
+│ Name                                       │ Size           │ Pages       │ Cached Size    │ Cached Pages│ Percent │
+├────────────────────────────────────────────┼────────────────┼─────────────┼────────────────┼─────────────┼─────────┤
+│ /opt/google/chrome/chrome                  │ 256.019M       │ 65541       │ 256.019M       │ 65541       │ 100.000 │
+│ /opt/wechat/RadiumWMPF/runtime/WeChatAppEx │ 201.518M       │ 51589       │ 201.518M       │ 51589       │ 100.000 │
+│ /snap/typora/112/typora/Typora             │ 186.597M       │ 47769       │ 186.597M       │ 47769       │ 100.000 │
+├────────────────────────────────────────────┼────────────────┼─────────────┼────────────────┼─────────────┼─────────┤
+│ Sum                                        │ 644.134M       │ 164899      │ 644.134M       │ 164899      │ 100.000 │
+└────────────────────────────────────────────┴────────────────┴─────────────┴────────────────┴─────────────┴─────────┘</code></pre>
+
+<h3>纯文本无边框</h3>
+
+<pre><code>$ pgcache --plain --top 3
+Name                                        Size            Pages        Cached Size     Cached Pages Percent
+/opt/google/chrome/chrome                   256.019M        65541        256.019M        65541        100.000
+/opt/wechat/RadiumWMPF/runtime/WeChatAppEx  201.518M        51589        201.518M        51589        100.000
+/snap/typora/112/typora/Typora              186.597M        47769        186.597M        47769        100.000
+Sum                                         644.134M        164899       644.134M        164899       100.000</code></pre>
+
+<h3>CSV 格式输出</h3>
+
+<pre><code>$ pgcache --terse --top 3
+name,size,timestamp,mtime,pages,cached,percent
+/opt/google/chrome/chrome,268455128,1779069856,1759949937,65541,65541,100
+/opt/wechat/RadiumWMPF/runtime/WeChatAppEx,211307216,1779069856,1773125497,51589,51589,100
+/snap/typora/112/typora/Typora,195661440,1779069856,1763518844,47769,47769,100</code></pre>
+
+<p>适合用 <code>awk</code>、<code>csvtool</code>、Python pandas 等工具二次处理。配合 <code>--nohdr</code> 可跳过表头行。</p>
+
+<h3>JSON 格式输出</h3>
+
+<pre><code>$ pgcache --json --top 2
+[
+  {
+    "filename": "/opt/google/chrome/chrome",
+    "size": 268455128,
+    "timestamp": 1779069856,
+    "mtime": 1759949937,
+    "pages": 65541,
+    "cached": 65541,
+    "uncached": 0,
+    "percent": 100,
+    "status": []
+  },
+  ...
+]</code></pre>
+
+<p>每条记录包含完整的文件信息。<code>status</code> 字段默认为空数组。</p>
+
+<h3>JSON 含逐页状态</h3>
+
+<pre><code>$ pgcache --json --pps /usr/bin/ls
+[{
+  "filename": "/usr/bin/ls",
+  "size": 142312,
+  "timestamp": 1779069856,
+  "mtime": 1750000000,
+  "pages": 35,
+  "cached": 35,
+  "uncached": 0,
+  "percent": 100,
+  "status": [true,true,true,true,true,true,true,true,...]
+}]</code></pre>
+
+<p><code>status</code> 数组中每个元素对应文件的一页：<code>true</code> = 在缓存中，<code>false</code> = 不在。可用于精确分析缓存分布。</p>
+
+<h3>直方图可视化</h3>
+
+<pre><code>$ pgcache --histo --top 5
+/opt/google/chrome/chrome                             65541 ████████████████████████████
+/opt/wechat/RadiumWMPF/runtime/WeChatAppEx            51589 ████████████████████████
+/snap/typora/112/typora/Typora                        47769 ██████████████████████
+/snap/code/238/usr/share/code/code                    47099 ██████████████████████
+/snap/thunderbird/1104/usr/lib/thunderbird/libxul.so  44796 █████████████████████</code></pre>
+
+<p>使用 Unicode 块字符表示缓存比例：</p>
+
+<table>
+  <tr><th>字符</th><th>含义</th><th>缓存比例</th></tr>
+  <tr><td>▁</td><td>下 1/8</td><td>0%</td></tr>
+  <tr><td>▂</td><td>下 2/8</td><td>&lt;16%</td></tr>
+  <tr><td>▃</td><td>下 3/8</td><td>&lt;33%</td></tr>
+  <tr><td>▄</td><td>下 4/8</td><td>&lt;50%</td></tr>
+  <tr><td>▅</td><td>下 5/8</td><td>&lt;66%</td></tr>
+  <tr><td>▆</td><td>下 6/8</td><td>&lt;83%</td></tr>
+  <tr><td>▇</td><td>下 7/8</td><td>&lt;100%</td></tr>
+  <tr><td>█</td><td>满</td><td>100%</td></tr>
+</table>
+
+<p>当终端宽度不足以显示每一页时，自动将多页分桶聚合为一个块字符。</p>
+
+<h3>组合选项</h3>
+
+<pre><code># 无表头 + basename，适合脚本解析
+$ pgcache --top 10 --bname --nohdr --plain
+
+# CSV 格式 + 无表头
+$ pgcache --terse --top 5 --nohdr</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="compare">2.5 与其他工具对比</h2>
+
+<table>
+  <tr><th>工具</th><th>语言</th><th>核心功能</th><th>特点</th></tr>
+  <tr>
+    <td><strong>pgcache (C)</strong></td>
+    <td>C</td>
+    <td>mincore 检测 page cache</td>
+    <td>零依赖，支持 --top 全局扫描，多种输出格式</td>
+  </tr>
+  <tr>
+    <td>pgcache (Go)</td>
+    <td>Go</td>
+    <td>同上</td>
+    <td>原始版本，依赖 pcstat 库</td>
+  </tr>
+  <tr>
+    <td>pcstat</td>
+    <td>Go</td>
+    <td>单文件/进程缓存检测</td>
+    <td>pgcache 的上游项目，无 --top</td>
+  </tr>
+  <tr>
+    <td>fincore</td>
+    <td>C</td>
+    <td>mincore 封装</td>
+    <td>coreutils 的一部分，无全局扫描</td>
+  </tr>
+  <tr>
+    <td>vmtouch</td>
+    <td>C</td>
+    <td>查看/控制 page cache</td>
+    <td>功能更丰富，支持 evict/touch 操作</td>
+  </tr>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="notes">2.6 注意事项</h2>
+
+<div class="note">
+  <strong>需要 root 权限</strong> 才能读取其他进程的 <code>/proc/[pid]/maps</code> 和切换 mount namespace。普通用户只能查看自己进程的信息。
+</div>
+
+<div class="card">
+  <h4>详细注意事项</h4>
+  <ol>
+    <li><strong><code>--top</code> 扫描较慢</strong> — 需要对系统上所有映射文件执行 mincore。文件数量取决于进程数和每个进程加载的共享库数量。一台典型的 Linux 桌面系统可能有数千个唯一文件。</li>
+    <li><strong>结果是瞬时快照</strong> — 进程可能随时创建/退出，page cache 随时变化。结果反映执行 mincore 时刻的状态，不代表过去或未来。</li>
+    <li><strong>大文件 mmap 可能失败</strong> — 32 位系统上虚拟地址空间有限（通常 3GB 用户空间），超大文件（如几个 GB 的数据库文件）可能无法映射，会被跳过。</li>
+    <li><strong>Deleted files 会被跳过</strong> — <code>/proc/[pid]/maps</code> 中标记为 <code>(deleted)</code> 的文件无法打开（文件已被删除但进程仍持有句柄），pgcache 会自动跳过。</li>
+    <li><strong>Cached Size 是估算值</strong> — 通过 <code>Size × Percent / 100</code> 计算。实际缓存的字节数取决于页对齐（最后一页可能只缓存了部分字节）。</li>
+    <li><strong>百分比精度</strong> — 文件的最后一页可能不满 4KB，但 mincore 仍然报告整页状态。因此对小文件或非页对齐大小的文件，百分比可能略有偏差。</li>
+  </ol>
+</div>
+
+<div style="text-align:center;margin-top:40px;padding:20px;color:var(--muted);font-size:0.85em;">
+  pgcache C 实现 — 基于 mincore(2) 系统调用的 Linux Page Cache 分析工具<br>
+  零外部依赖 · 纯 C11 + POSIX/Linux API
+</div>
+
+</div>
+</body>
+</html>
